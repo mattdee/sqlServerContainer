@@ -26,6 +26,7 @@ SQLSERVER_VOLUME="${SQLSERVER_VOLUME:-sqlserver_data}"
 SQLSERVER_NETWORK="${SQLSERVER_NETWORK:-sqlservernet}"
 SQLSERVER_IMAGE="${SQLSERVER_IMAGE:-mcr.microsoft.com/mssql/server:2022-latest}"
 CONTAINER_PORT_MAP="${CONTAINER_PORT_MAP:--p 1433:1433}"
+SQLSERVER_PLATFORM="linux/amd64" # Official SQL Server Linux images require x86-64.
 MAX_INVALID=3
 INVALID_COUNT=0
 
@@ -75,7 +76,7 @@ displayMenu() {
     echo "  12) Run test query                  14) Copy file out of container"
 
     echo -e "\n${CYAN}===========================================================================${NC}"
-    read -p "Please enter your choice [1-14]: " menuChoice
+    read -r -p "Please enter your choice [1-14]: " menuChoice || exit 0
     export menuChoice=$menuChoice
 }
 
@@ -94,6 +95,10 @@ resolveEngine() {
 
 checkContainerEngine() {
     resolveEngine
+    case "$CONTAINER_ENGINE" in
+        docker|podman) ;;
+        *) logError "CONTAINER_ENGINE must be auto, docker, or podman."; exit 1 ;;
+    esac
 
     if ! command -v "$CONTAINER_ENGINE" > /dev/null 2>&1; then
         logError "$CONTAINER_ENGINE is not installed on your system."
@@ -103,13 +108,34 @@ checkContainerEngine() {
     if [ "$CONTAINER_ENGINE" = "podman" ]; then
         if ! podman ps > /dev/null 2>&1; then
             logInfo "Podman is installed but not running. Starting Podman machine..."
-            podman machine start
+            podman machine start || exit 1
         fi
     elif ! docker ps > /dev/null 2>&1; then
         logError "Docker is installed but the Docker daemon is not available."
         logWarning "Start Docker Desktop or set CONTAINER_ENGINE=podman to use Podman."
         exit 1
     fi
+    if ! "$CONTAINER_ENGINE" info > /dev/null 2>&1; then
+        logError "Cannot connect to $CONTAINER_ENGINE. Check your engine or remote connection."
+        exit 1
+    fi
+}
+
+checkArchitecture() {
+    local arch
+    if [ "$CONTAINER_ENGINE" = "docker" ]; then
+        arch=$(docker info --format '{{.Architecture}}') || return 1
+    else
+        arch=$(podman info --format '{{.Host.Arch}}') || return 1
+    fi
+    case "$arch" in
+        amd64|x86_64) ;;
+        arm64|aarch64)
+            logWarning "SQL Server requires AMD64 translation on this ARM64 engine. Microsoft does not support emulated SQL Server."
+            logWarning "On Apple Silicon, enable Rosetta for your Podman machine or in Docker Desktop if SQL Server crashes."
+            ;;
+        *) logError "Unsupported engine architecture: $arch"; return 1 ;;
+    esac
 }
 
 createContainerNetwork() {
@@ -122,11 +148,11 @@ createContainerNetwork() {
 }
 
 getContainerId() {
-    "$CONTAINER_ENGINE" ps --no-trunc --format "{{.Names}}" | grep -i "^${SQLSERVER_CONTAINER}$"
+    "$CONTAINER_ENGINE" ps --no-trunc --format "{{.Names}}" | grep -Fx -- "$SQLSERVER_CONTAINER"
 }
 
 getContainerPresent() {
-    "$CONTAINER_ENGINE" ps -a --no-trunc --format "{{.Names}}" | grep -i "^${SQLSERVER_CONTAINER}$"
+    "$CONTAINER_ENGINE" ps -a --no-trunc --format "{{.Names}}" | grep -Fx -- "$SQLSERVER_CONTAINER"
 }
 
 countDown() {
@@ -157,15 +183,21 @@ badChoice() {
 
 waitForSqlServer() {
     checkContainerEngine
-    sqlContainer=$(getContainerId)
+    sqlContainer=$(getContainerPresent)
 
     if [ -z "$sqlContainer" ]; then
-        logError "SQL Server container is not running."
+        logError "SQL Server container was not found."
         return 1
     fi
 
     logInfo "Waiting for SQL Server to accept connections..."
     for i in {1..30}; do
+        if [ "$("$CONTAINER_ENGINE" inspect --format '{{.State.Running}}' "$SQLSERVER_CONTAINER")" != "true" ]; then
+            logError "SQL Server exited during startup. Recent logs:"
+            "$CONTAINER_ENGINE" logs --tail 25 "$SQLSERVER_CONTAINER"
+            logWarning "On ARM64, a segmentation fault can indicate incompatible AMD64 emulation. Use Rosetta on Apple Silicon."
+            return 1
+        fi
         if runSqlQuery "SELECT 1" > /dev/null 2>&1; then
             logSuccess "SQL Server is ready."
             return 0
@@ -203,9 +235,9 @@ runSqlQuery() {
     fi
 
     if [[ "$sqlcmd" == *"mssql-tools18"* ]]; then
-        "$CONTAINER_ENGINE" exec "$sqlContainer" "$sqlcmd" -S localhost -U "$SQLSERVER_USER" -P "$SQLSERVER_SA_PASS" -C -Q "$query"
+        "$CONTAINER_ENGINE" exec "$sqlContainer" "$sqlcmd" -S localhost -U "$SQLSERVER_USER" -P "$SQLSERVER_SA_PASS" -C -b -l 2 -t 2 -Q "$query"
     else
-        "$CONTAINER_ENGINE" exec "$sqlContainer" "$sqlcmd" -S localhost -U "$SQLSERVER_USER" -P "$SQLSERVER_SA_PASS" -Q "$query"
+        "$CONTAINER_ENGINE" exec "$sqlContainer" "$sqlcmd" -S localhost -U "$SQLSERVER_USER" -P "$SQLSERVER_SA_PASS" -b -l 2 -t 2 -Q "$query"
     fi
 }
 
@@ -227,7 +259,7 @@ doNothing() {
 pullImage() {
     checkContainerEngine
     logInfo "Pulling SQL Server image: $SQLSERVER_IMAGE"
-    "$CONTAINER_ENGINE" pull "$SQLSERVER_IMAGE"
+    "$CONTAINER_ENGINE" pull --platform "$SQLSERVER_PLATFORM" "$SQLSERVER_IMAGE"
 }
 
 listPorts() {
@@ -263,7 +295,8 @@ showLogs() {
 
 startSqlServer() {
     checkContainerEngine
-    createContainerNetwork
+    checkArchitecture || return 1
+    createContainerNetwork || return 1
 
     sqlRunning=$(getContainerId)
     sqlPresent=$(getContainerPresent)
@@ -274,12 +307,13 @@ startSqlServer() {
         return
     elif [ "$sqlPresent" = "$SQLSERVER_CONTAINER" ]; then
         logInfo "SQL Server $CONTAINER_ENGINE container found, restarting..."
-        "$CONTAINER_ENGINE" restart "$SQLSERVER_CONTAINER"
-        waitForSqlServer
+        "$CONTAINER_ENGINE" restart "$SQLSERVER_CONTAINER" || return 1
+        waitForSqlServer || return 1
     else
         logInfo "Provisioning new SQL Server container with image: $SQLSERVER_IMAGE"
-        "$CONTAINER_ENGINE" volume create "$SQLSERVER_VOLUME" > /dev/null
+        "$CONTAINER_ENGINE" volume create "$SQLSERVER_VOLUME" > /dev/null || return 1
         "$CONTAINER_ENGINE" run -d \
+            --platform "$SQLSERVER_PLATFORM" \
             --name "$SQLSERVER_CONTAINER" \
             --network "$SQLSERVER_NETWORK" \
             $CONTAINER_PORT_MAP \
@@ -297,7 +331,7 @@ startSqlServer() {
         fi
 
         logSuccess "SQL Server container started successfully."
-        waitForSqlServer
+        waitForSqlServer || return 1
     fi
 
     listPorts
@@ -482,6 +516,7 @@ showHelp() {
     echo "  help     - Show this help message"
     echo
     echo "Configuration:"
+    echo "  Images are pulled and run as linux/amd64; ARM64 engines need AMD64 translation."
     echo "  Override SQLSERVER_SA_PASS, SQLSERVER_IMAGE, SQLSERVER_PID,"
     echo "  SQLSERVER_CONTAINER, SQLSERVER_VOLUME, SQLSERVER_NETWORK, and CONTAINER_PORT_MAP."
     echo
@@ -497,58 +532,58 @@ case "$1" in
     "start")
         logInfo "Starting container..."
         startSqlServer
-        exit 0
+        exit $?
         ;;
     "stop")
         logInfo "Stopping container..."
         stopSqlServer
-        exit 0
+        exit $?
         ;;
     "restart")
         logInfo "Restarting container..."
         stopSqlServer
         startSqlServer
-        exit 0
+        exit $?
         ;;
     "bash")
         logInfo "Attempting bash access..."
         bashAccess
-        exit 0
+        exit $?
         ;;
     "root")
         logInfo "Attempting root access..."
         rootAccess
-        exit 0
+        exit $?
         ;;
     "sql")
         logInfo "Attempting sqlcmd access..."
         sqlCmdUser
-        exit 0
+        exit $?
         ;;
     "test")
         logInfo "Attempting SQL Server test query..."
         testQuery
-        exit 0
+        exit $?
         ;;
     "status")
         showStatus
-        exit 0
+        exit $?
         ;;
     "logs")
         showLogs
-        exit 0
+        exit $?
         ;;
     "pull")
         pullImage
-        exit 0
+        exit $?
         ;;
     "remove")
         removeContainer
-        exit 0
+        exit $?
         ;;
     "help")
         showHelp
-        exit 0
+        exit $?
         ;;
     "")
         logInfo "No args provided. Starting menu interface..."
@@ -617,6 +652,6 @@ while true; do
 
     if [[ $menuChoice != 10 && $menuChoice =~ ^([1-9]|1[0-4])$ ]]; then
         echo
-        read -p "Press Enter to continue..." dummy
+        read -r -p "Press Enter to continue..."
     fi
 done

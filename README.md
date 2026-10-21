@@ -153,6 +153,83 @@ If your host supports that image, try:
 SQLSERVER_IMAGE='mcr.microsoft.com/mssql/rhel/server:2025-latest' ./sqlServerContainer.sh start
 ```
 
+## AMD64 and ARM64 hosts
+
+The same script always pulls and runs `linux/amd64`, because the official SQL Server Linux image requires x86-64:
+
+| Container engine architecture | Execution |
+| --- | --- |
+| AMD64 / x86_64 | Native SQL Server execution |
+| ARM64 / aarch64 | Requires working AMD64 translation; on Apple Silicon, use Rosetta |
+
+Microsoft does not test or support SQL Server under Rosetta or QEMU. ARM64 execution is a local development workaround, not a supported production deployment. See [Microsoft's container deployment guidance](https://learn.microsoft.com/en-us/sql/linux/containers/deploy) and [Podman's Rosetta setup](https://podman-desktop.io/docs/podman/rosetta).
+
+### Apple Silicon with Podman
+
+Inspect the active engine and VM first:
+
+```bash
+podman info --format '{{.Host.Arch}}'
+podman machine list
+podman machine inspect
+```
+
+Enabling Rosetta in `containers.conf` and restarting the existing VM enabled `/mnt/rosetta` as its AMD64 interpreter preserving the existing containers and volumes. 
+
+The script's readiness check and `SELECT @@VERSION` then succeeded, reporting SQL Server 2022 CU27 Express (16.0.4295.3).
+
+
+Modify the `~/.config/containers/containers.conf` with this setting under its existing `[machine]` section:
+
+```toml
+[machine]
+rosetta = true
+```
+
+To apply it to the current VM run:
+
+```bash
+podman machine stop podman-machine-default
+podman machine start podman-machine-default
+podman machine inspect podman-machine-default
+CONTAINER_ENGINE=podman ./sqlServerContainer.sh start
+CONTAINER_ENGINE=podman ./sqlServerContainer.sh test
+```
+
+Restart any other previously running containers, for example `podman start MoMoMatt`. Confirm `Rosetta: true` and test actual AMD64 execution; the setting alone does not prove the translator works.
+
+
+### Alternative/fallback approach
+Alternatively, create a separate machine using an unused name:
+
+```bash
+CONTAINERS_MACHINE_ROSETTA=true podman machine init --provider applehv --cpus 4 --memory 8192 --disk-size 40 sqlserver-arm-dev
+podman machine inspect sqlserver-arm-dev
+```
+
+Confirm `Rosetta: true` before continuing.
+
+When ready:
+
+```bash
+podman machine stop podman-machine-default
+podman machine start sqlserver-arm-dev
+CONTAINER_CONNECTION=sqlserver-arm-dev CONTAINER_ENGINE=podman ./sqlServerContainer.sh start
+CONTAINER_CONNECTION=sqlserver-arm-dev CONTAINER_ENGINE=podman ./sqlServerContainer.sh test
+```
+
+The new VM has separate storage: this creates a fresh SQL Server database volume; existing databases remain in the original VM. If Rosetta cannot be enabled, use an AMD64 Linux engine and point Docker or Podman at that remote engine.
+
+## Validation
+
+```bash
+bash -n sqlServerContainer.sh
+shellcheck -S warning sqlServerContainer.sh
+python3 -m unittest discover -s tests -v
+```
+
+The tests use simulated Docker/Podman engines to cover AMD64/ARM64 image selection, pull platform selection, startup crashes, creation failures, and unsupported architectures. They do not establish that SQL Server itself runs on physical AMD64 hardware or under an ARM64 translator.
+
 ## Data Persistence
 
 The script creates a named volume and mounts it at SQL Server's data directory:
